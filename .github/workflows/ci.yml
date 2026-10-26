@@ -110,6 +110,17 @@ jobs:
                 python${{matrix.config.python3_ver}} -c "from SoapySDR import *; print(SOAPY_SDR_TIMEOUT)"
                 python${{matrix.config.python3_ver}} -c "import SoapySDR; print(SoapySDR.errToStr(SoapySDR.SOAPY_SDR_TIMEOUT))"
                 python${{matrix.config.python3_ver}} -c "import SoapySDR; print(SoapySDR.Device.make('driver=null'))"
+
+                # a replaced log handler must receive messages rather than fall back to the C handler
+                python${{matrix.config.python3_ver}} -c "
+                import SoapySDR
+                got = []
+                SoapySDR.registerLogHandler(lambda l, m: got.append('a'))
+                SoapySDR.registerLogHandler(lambda l, m: got.append('b'))
+                SoapySDR.log(SoapySDR.SOAPY_SDR_INFO, 'x')
+                SoapySDR.registerLogHandler(None)
+                assert got == ['b'], got
+                "
           - name: Test LuaJIT bindings
             run: |
                 luajit -e 'SoapySDR = require("SoapySDR"); print(SoapySDR.API_VERSION)'

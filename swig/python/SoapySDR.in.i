@@ -32,6 +32,7 @@ See https://pothosware.github.io/SoapySDR/doxygen/latest/index.html for details.
 ////////////////////////////////////////////////////////////////////////
 %pythonbegin %{
 import os
+import threading
 
 if os.name == 'nt' and hasattr(os, 'add_dll_directory'):
     root_dir = __file__
@@ -229,30 +230,129 @@ SoapySDR library: {2}""".format(COMPILE_ABI_VERSION, PYTHONLIB_ABI_VERSION, CORE
 
 %feature("director") _SoapySDR_pythonLogHandlerBase;
 
+// Log handler synchronization state, kept out of the SWIG-parsed block.
+// Tracked by handler id since a handler may be deleted inside its own callback.
+%{
+#include <algorithm>
+#include <condition_variable>
+#include <map>
+#include <mutex>
+#include <vector>
+
+    namespace
+    {
+        typedef unsigned long long _SoapySDR_logHandlerId;
+
+        std::mutex &_SoapySDR_logHandlerMutex(void)
+        {
+            static std::mutex mutex;
+            return mutex;
+        }
+
+        std::condition_variable &_SoapySDR_logHandlerCv(void)
+        {
+            static std::condition_variable cv;
+            return cv;
+        }
+
+        // Callbacks in progress per handler id.
+        std::map<_SoapySDR_logHandlerId, size_t> &_SoapySDR_logHandlersInFlight(void)
+        {
+            static std::map<_SoapySDR_logHandlerId, size_t> inFlight;
+            return inFlight;
+        }
+
+        // Handler ids with a callback in progress on this thread, innermost last.
+        thread_local std::vector<_SoapySDR_logHandlerId> _SoapySDR_logHandlersOnThread;
+
+        _SoapySDR_logHandlerId _SoapySDR_nextLogHandlerId(void)
+        {
+            static _SoapySDR_logHandlerId next = 0;
+            std::lock_guard<std::mutex> lock(_SoapySDR_logHandlerMutex());
+            return ++next;
+        }
+    }
+%}
+
 %inline %{
     class _SoapySDR_pythonLogHandlerBase
     {
     public:
-        _SoapySDR_pythonLogHandlerBase(void)
+        _SoapySDR_pythonLogHandlerBase(void):
+            id(_SoapySDR_nextLogHandlerId())
         {
+        }
+
+        virtual ~_SoapySDR_pythonLogHandlerBase(void)
+        {
+            detach();
+        }
+
+        // Called from Python after construction so the director knows its Python self.
+        void attach(void)
+        {
+            std::lock_guard<std::mutex> lock(_SoapySDR_logHandlerMutex());
             globalHandle = this;
             SoapySDR::registerLogHandler(&globalHandler);
         }
-        virtual ~_SoapySDR_pythonLogHandlerBase(void)
+
+        // Restore the default, C coded, log handler if this is the active one.
+        // Waits for callbacks on other threads to finish before returning.
+        void detach(void)
         {
-            globalHandle = nullptr;
-            // Restore the default, C coded, log handler.
-            SoapySDR::registerLogHandler(nullptr);
+            std::unique_lock<std::mutex> lock(_SoapySDR_logHandlerMutex());
+            if (globalHandle == this)
+            {
+                globalHandle = nullptr;
+                SoapySDR::registerLogHandler(nullptr);
+            }
+            const size_t own = std::count(
+                _SoapySDR_logHandlersOnThread.begin(),
+                _SoapySDR_logHandlersOnThread.end(), id);
+            const _SoapySDR_logHandlerId myId = id;
+            _SoapySDR_logHandlerCv().wait(lock, [myId, own]
+            {
+                const auto &inFlight = _SoapySDR_logHandlersInFlight();
+                const auto it = inFlight.find(myId);
+                return it == inFlight.end() || it->second <= own;
+            });
         }
+
         virtual void handle(const SoapySDR::LogLevel, const char *) = 0;
 
     private:
         static void globalHandler(const SoapySDR::LogLevel logLevel, const char *message)
         {
-            if (globalHandle != nullptr) globalHandle->handle(logLevel, message);
+            _SoapySDR_pythonLogHandlerBase *h = nullptr;
+            _SoapySDR_logHandlerId id = 0;
+            {
+                std::lock_guard<std::mutex> lock(_SoapySDR_logHandlerMutex());
+                h = globalHandle;
+                if (h == nullptr) return;
+                id = h->id;
+                _SoapySDR_logHandlersInFlight()[id]++;
+                _SoapySDR_logHandlersOnThread.push_back(id);
+            }
+
+            // Release the claim even if the handler throws; h may be gone by then.
+            struct Release
+            {
+                _SoapySDR_logHandlerId id;
+                ~Release(void)
+                {
+                    std::lock_guard<std::mutex> lock(_SoapySDR_logHandlerMutex());
+                    _SoapySDR_logHandlersOnThread.pop_back();
+                    auto &inFlight = _SoapySDR_logHandlersInFlight();
+                    if (--inFlight[id] == 0) inFlight.erase(id);
+                    _SoapySDR_logHandlerCv().notify_all();
+                }
+            } release{id};
+
+            h->handle(logLevel, message);
         }
 
         static _SoapySDR_pythonLogHandlerBase *globalHandle;
+        const _SoapySDR_logHandlerId id;
     };
 %}
 
@@ -263,6 +363,7 @@ SoapySDR library: {2}""".format(COMPILE_ABI_VERSION, PYTHONLIB_ABI_VERSION, CORE
 %insert("python")
 %{
 _SoapySDR_globalLogHandlers = [None]
+_SoapySDR_globalLogHandlersLock = threading.Lock()
 
 class _SoapySDR_pythonLogHandler(_SoapySDR_pythonLogHandlerBase):
     def __init__(self, handler):
@@ -270,6 +371,11 @@ class _SoapySDR_pythonLogHandler(_SoapySDR_pythonLogHandlerBase):
         getattr(_SoapySDR_pythonLogHandlerBase, '__init__')(self)
 
     def handle(self, *args): self.handler(*args)
+
+    def __del__(self):
+        # stop C++ callbacks before the instance attributes are cleared
+        try: self.detach()
+        except Exception: pass
 
 def registerLogHandler(handler):
     """Register a new system log handler.
@@ -284,12 +390,20 @@ def registerLogHandler(handler):
 
     :type handler: Callable[[int, str], None] or None
 
+    Replacing or clearing the handler waits for any callback currently
+    running on another thread to finish before the previous handler is
+    released. A handler may itself call registerLogHandler().
+
     :returns: None
     """
-    if handler is None:
-        _SoapySDR_globalLogHandlers[0] = None
-    else:
-        _SoapySDR_globalLogHandlers[0] = _SoapySDR_pythonLogHandler(handler)
+    new = None if handler is None else _SoapySDR_pythonLogHandler(handler)
+    with _SoapySDR_globalLogHandlersLock:
+        old = _SoapySDR_globalLogHandlers[0]
+        _SoapySDR_globalLogHandlers[0] = new
+        if new is not None: new.attach()
+    if old is not None:
+        # may block on a callback in progress, so do this outside the lock
+        old.detach()
 %}
 
 ////////////////////////////////////////////////////////////////////////
